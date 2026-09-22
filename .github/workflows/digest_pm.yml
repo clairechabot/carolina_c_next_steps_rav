@@ -1,0 +1,145 @@
+name: Evening Edition
+
+# The single daily email + full web edition. Merges the morning scan's
+# pending pool with a fresh evening scan, has Vern score everything, sends
+# the short email cover, and rebuilds the GitHub Pages site (full edition,
+# Archive, Grove).
+#
+# Delivery target: 18:30 Europe/Zurich, where the reader reads
+# it. GitHub cron is fixed UTC, Zurich shifts with DST, and scheduled
+# runs can start up to an hour late - so precision comes from three parts:
+#   1. Two crons fire at 18:00 local in their season: 16:00 UTC for CEST
+#      (summer), 17:00 UTC for CET (winter). (The repo is expected to be private: Actions minutes are metered on
+#      private repos, so the hold is kept short - on-time delivery now
+#      depends on GitHub's cron delay staying under ~25 min, which it
+#      usually does; a longer delay means a slightly late email, never a
+#      missed one.)
+#   2. A season guard skips the wrong cron by comparing which cron fired
+#      (github.event.schedule) against Zurich's CURRENT UTC offset
+#      (+0200 summer / +0100 winter). Offset, not wall-clock hour: a
+#      delayed right-season run must still pass. The first version of
+#      this guard checked the hour and silently dropped an edition when
+#      both crons started late - never again.
+#   3. After fetching and scoring, a hold step sleeps until 18:25 local,
+#      then the email goes out - landing ~18:26-18:30 regardless of how
+#      late the cron fired (a delay beyond 18:25 sends immediately).
+# Manual workflow_dispatch runs skip the guard and the hold: they send
+# right away.
+
+on:
+  schedule:
+    - cron: "0 16 * * *"    # 18:00 Europe/Zurich during CEST (summer)
+    - cron: "0 17 * * *"    # 18:00 Europe/Zurich during CET (winter)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: digest
+  cancel-in-progress: false
+
+jobs:
+  edition:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      TZ: Europe/Zurich
+      CLAUDE_API_KEY:    ${{ secrets.CLAUDE_API_KEY }}
+      CLAUDE_MODEL:      ${{ vars.CLAUDE_MODEL }}
+      CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
+      ADZUNA_APP_ID:     ${{ secrets.ADZUNA_APP_ID }}
+      ADZUNA_APP_KEY:    ${{ secrets.ADZUNA_APP_KEY }}
+      SMTP_USER:         ${{ secrets.SMTP_USER }}
+      SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+      EMAIL_TO:          ${{ secrets.EMAIL_TO }}
+      RECIPIENT_NAME:    ${{ secrets.RECIPIENT_NAME }}
+      EDITION_URL:       ${{ vars.EDITION_URL }}
+      SHEET_WEBHOOK_URL: ${{ vars.SHEET_WEBHOOK_URL }}
+      SHEET_CSV_URL:     ${{ vars.SHEET_CSV_URL }}
+      SHEET_TOKEN:       ${{ vars.SHEET_TOKEN }}
+      SHEET_LINK_URL:    ${{ vars.SHEET_LINK_URL }}
+    steps:
+      - name: Season guard - skip the wrong-DST cron firing
+        if: github.event_name == 'schedule'
+        run: |
+          OFFSET=$(TZ=Europe/Zurich date +%z)
+          CRON="${{ github.event.schedule }}"
+          echo "Cron '$CRON' fired; Zurich UTC offset now: $OFFSET"
+          if [ "$CRON" = "0 16 * * *" ] && [ "$OFFSET" != "+0200" ]; then
+            echo "Summer cron during standard time; the 17:00 cron covers today. Skipping."
+            echo "SKIP_EDITION=1" >> "$GITHUB_ENV"
+          fi
+          if [ "$CRON" = "0 17 * * *" ] && [ "$OFFSET" != "+0100" ]; then
+            echo "Winter cron during daylight time; the 16:00 cron covers today. Skipping."
+            echo "SKIP_EDITION=1" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@v4
+        if: env.SKIP_EDITION != '1'
+
+      - uses: actions/setup-python@v5
+        if: env.SKIP_EDITION != '1'
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        if: env.SKIP_EDITION != '1'
+        run: pip install --quiet -r requirements.txt
+
+      - name: Fetch (merge pending pool), curate, build web edition
+        if: env.SKIP_EDITION != '1'
+        run: |
+          python fetch.py
+          python curate.py --edition evening
+          python webpage.py
+
+      - name: Hold until 18:25 Zurich time
+        if: env.SKIP_EDITION != '1' && github.event_name == 'schedule'
+        run: |
+          TARGET=$(TZ=Europe/Zurich date -d "18:25" +%s)
+          NOW=$(date +%s)
+          WAIT=$(( TARGET - NOW ))
+          if [ $WAIT -gt 0 ]; then
+            echo "Holding $WAIT seconds so the email lands at 18:25-18:30 Zurich time."
+            sleep $WAIT
+          else
+            echo "Already past 18:25 Zurich time; sending immediately."
+          fi
+
+      - name: Send the email
+        if: env.SKIP_EDITION != '1'
+        run: python render.py
+
+      - name: Commit state (history, cleared pending, editions, docs/Pages)
+        if: env.SKIP_EDITION != '1'
+        run: |
+          git config user.name "vern-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add history.json pending_jobs.json editions/ docs/
+          git diff --cached --quiet || git commit -m "Evening edition $(date +%F)"
+          git pull --rebase origin ${GITHUB_REF_NAME}
+          git push
+
+      # The repo is PRIVATE; the public site lives in a separate tiny repo
+      # holding only the rendered pages. Needs: public repo (vars.EDITION_REPO,
+      # e.g. owner/next-chapter-edition) + fine-grained PAT with Contents
+      # read/write on ONLY that repo (secrets.EDITION_DEPLOY_TOKEN). Unset =
+      # step skips (e.g. while the repo is public and serves its own /docs).
+      - name: Publish rendered edition to the public site repo
+        if: env.SKIP_EDITION != '1'
+        env:
+          EDITION_DEPLOY_TOKEN: ${{ secrets.EDITION_DEPLOY_TOKEN }}
+          EDITION_REPO:         ${{ vars.EDITION_REPO }}
+        run: |
+          if [ -z "$EDITION_DEPLOY_TOKEN" ] || [ -z "$EDITION_REPO" ]; then
+            echo "Edition repo not configured - skipping publish."
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${EDITION_DEPLOY_TOKEN}@github.com/${EDITION_REPO}.git" /tmp/edition
+          rsync -a --delete --exclude .git docs/ /tmp/edition/
+          cd /tmp/edition
+          git add -A
+          git -c user.name=vern-bot -c user.email=actions@users.noreply.github.com \
+            commit -m "Evening edition $(date +%F)" || { echo "No changes."; exit 0; }
+          git push

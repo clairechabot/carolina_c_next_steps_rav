@@ -1,0 +1,49 @@
+name: Morning Scan (silent)
+
+# Scans all job sources and banks new finds into pending_jobs.json - NO email,
+# no Claude spend. The Evening Edition merges this pool into the single daily
+# send. Silent, so exact timing barely matters: 04:25 UTC lands ~06:25
+# Zurich in summer, ~05:25 in winter - well before anyone is awake and
+# hours before the evening pipeline consumes the pool.
+
+on:
+  schedule:
+    - cron: "25 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: digest
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Zurich
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Scan sources into the pending pool
+        env:
+          ADZUNA_APP_ID:  ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+        run: python fetch.py --scan-only
+
+      - name: Commit pending pool
+        run: |
+          git config user.name "vern-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add pending_jobs.json
+          git diff --cached --quiet || git commit -m "Morning scan $(date +%F)"
+          git pull --rebase origin ${GITHUB_REF_NAME}
+          git push
