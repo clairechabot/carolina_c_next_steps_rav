@@ -1,4 +1,7 @@
-# Client bundle — Carolina
+# Client setup — Carolina
+
+*The bundle has been applied to this repo (2026-09-22). This file keeps
+the checklist; the sections below marked done need no action.*
 
 Built 2026-09-22 from her intake form, CV, cover letter and writing
 sample. RAV facts still generic (advisor appointment pending): quota 10,
@@ -21,7 +24,7 @@ the repository. The operator holds them:
 `master-cv-private.md` (upload to the Claude Project instead of the
 committed copies).
 
-## Create her repo (one repo per client)
+## Create her repo (one repo per client) — DONE, steps 1-2
 
 1. On this template repo: **Settings → General → tick "Template
    repository"** (that is why the green "Use this template" button was
